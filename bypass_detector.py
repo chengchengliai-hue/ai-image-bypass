@@ -19,30 +19,35 @@ PARAMS = {
     "fft_enabled": True,
     "fft_mode": "model",         # "model"=1/f幂律, "ref"=参考图, "auto"=自动
     "fft_cutoff": 0.15,          # 低频保护半径缩小，让更多频率参与修改
-    "fft_strength": 0.85,        # 大幅提高，逼近真实图的频谱分布
-    "fft_alpha": 1.2,            # 1/f^α 的 α，略提高
-    "fft_randomness": 0.06,      # 翻倍，增加频率随机性
-    "fft_radial_smooth": 5,      # 降低平滑，保留更多频谱细节差异
+    "fft_strength": 0.65,        # 取 v8(0.85过高) 和 v9(0.55过糊) 中间
+    "fft_alpha": 1.0,            # alpha 太高=压高频=模糊，回到1.0
+    "fft_randomness": 0.04,
+    "fft_radial_smooth": 5,      # 回到5，保持细节
+
+    # ---- DFL 频谱对抗（拉 residual std）----
+    "dfl_enabled": True,
+    "dfl_iterations": 80,
+    "dfl_strength": 0.25,        # 微调
 
     # ---- 相机管线 ----
     "camera_enabled": True,
-    "bayer": True,               # 重新打开，用 OpenCV 去马赛克不会大色偏
-    "chroma_strength": 1.2,      # 加回色差
-    "vignette_strength": 0.22,   # 暗角加强
+    "bayer": True,
+    "chroma_strength": 1.2,
+    "vignette_strength": 0.22,
     "iso_scale": 1.0,
-    "read_noise": 2.5,           # 传感器噪声翻倍
-    "hot_pixel_prob": 5e-7,      # 坏点加多
-    "banding_strength": 0.01,    # 轻微条纹噪声
+    "read_noise": 2.5,
+    "hot_pixel_prob": 5e-7,
+    "banding_strength": 0.01,
     "motion_blur_kernel": 1,
-    "jpeg_cycles": 2,            # JPEG 压两次
-    "jpeg_qmin": 80,             # 降质量，引入更多块效应
+    "jpeg_cycles": 2,
+    "jpeg_qmin": 80,
     "jpeg_qmax": 92,
 
     # ---- 噪声和扰动 ----
     "noise_enabled": True,
-    "noise_std_frac": 0.025,     # 翻 2.5 倍
+    "noise_std_frac": 0.012,     # 减半
     "perturb_enabled": True,
-    "perturb_magnitude": 0.015,  # 翻 3 倍
+    "perturb_magnitude": 0.008,  # 减半
 
     # ---- 纹理归一化 (拉 residual std) ----
     "glcm_enabled": True,
@@ -66,6 +71,91 @@ def info(msg):
 
 def get_rng(seed=None):
     return np.random.default_rng(seed)
+
+
+# ============================================================
+# DFL 频谱对抗攻击（轻量版）
+# 用梯度下降最大化 FFT 频谱差异，LPIPS + L2 约束保证视觉不变
+# ============================================================
+
+def dfl_attack(img_rgb, iterations=80, lr=1e-3, strength=0.5, seed=None):
+    """
+    轻量版 DFL（Differential Frequency Loss）攻击。
+    用梯度下降找到"频谱变化最大、同时人眼几乎看不出"的像素级扰动。
+
+    iterations: 迭代次数，原项目 500，轻量版默认 80
+    lr: 学习率
+    strength: 最终混合强度 (0~1)，0=原图，1=完全应用扰动
+    """
+    import torch
+    import lpips
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _ = get_rng(seed)  # 固定 PyTorch 之外的随机种子
+
+    h, w = img_rgb.shape[:2]
+
+    # numpy → tensor，归一化到 [-1, 1]
+    arr = img_rgb.astype(np.float32)
+    img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    img_tensor = img_tensor / 127.5 - 1.0
+    img_tensor = img_tensor.to(device)
+
+    # 可学习的微小扰动
+    delta = (torch.randn_like(img_tensor) * 1e-5).requires_grad_(True).to(device)
+
+    optimizer = torch.optim.Adam([delta], lr=lr)
+    lpips_model = lpips.LPIPS(net='alex').to(device)
+
+    # 预计算原图 FFT
+    img_fft = torch.fft.fft2(img_tensor)
+
+    # 约束阈值（沿用原项目参数）
+    t_lpips = 0.04      # LPIPS 感知阈值
+    t_l2 = 3e-5         # L2 扰动阈值
+    c_lpips = 0.01      # LPIPS 惩罚系数
+    c_l2 = 0.6          # L2 惩罚系数
+    grad_clip = 0.05    # 梯度裁剪
+
+    for i in range(iterations):
+        optimizer.zero_grad()
+
+        # 扰动后的图
+        x_nw = img_tensor + delta
+        x_nw = torch.clamp(x_nw, -1, 1)
+
+        # (1) DFL: 负号 → 最小化 = 最大化频谱差异
+        x_nw_fft = torch.fft.fft2(x_nw)
+        loss_dfl = -torch.abs(x_nw_fft - img_fft).sum()
+
+        # (2) LPIPS: 感知相似度
+        loss_lpips = lpips_model(x_nw, img_tensor).mean()
+
+        # (3) L2: 扰动幅度
+        loss_l2 = torch.linalg.norm(delta)
+
+        # relu 软约束：只在超过阈值时才惩罚
+        lpips_penalty = c_lpips * torch.relu(loss_lpips - t_lpips)
+        l2_penalty = c_l2 * torch.relu(loss_l2 - t_l2)
+
+        total_loss = loss_dfl + lpips_penalty + l2_penalty
+        total_loss.backward()
+
+        # 梯度裁剪，防止单步变化过大
+        if delta.grad is not None:
+            delta.grad.data.clamp_(-grad_clip, grad_clip)
+
+        optimizer.step()
+
+    # 混合还原
+    with torch.no_grad():
+        final = img_tensor + delta * strength
+        final = torch.clamp(final, -1, 1)
+        final = (final + 1) / 2            # [-1,1] → [0,1]
+        final = final.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        final = np.clip(final * 255, 0, 255).astype(np.uint8)
+
+    return final
 
 
 # ============================================================
@@ -458,25 +548,34 @@ def add_fake_exif(img):
         return img  # 没装 piexif 就跳过
 
     # 品牌型号严格配对，避免 Sony + X-T4 这种自相矛盾
+    # 品牌、型号、镜头卡口严格配对
     camera_pool = [
-        ("Canon", "Canon EOS 5D Mark III"),
-        ("Canon", "Canon EOS R6"),
-        ("Nikon", "Nikon D850"),
-        ("Nikon", "Nikon Z6 II"),
-        ("Sony", "Sony Alpha 7R IV"),
-        ("Sony", "Sony A7 III"),
-        ("Fujifilm", "Fujifilm X-T4"),
-        ("Fujifilm", "Fujifilm X-T5"),
-        ("Olympus", "Olympus OM-D E-M1 Mark III"),
-        ("Leica", "Leica Q2"),
+        ("Canon", "Canon EOS 5D Mark III", "EF"),
+        ("Canon", "Canon EOS R6", "RF"),
+        ("Nikon", "Nikon D850", "AF-S"),
+        ("Nikon", "Nikon Z6 II", "NIKKOR Z"),
+        ("Sony", "Sony Alpha 7R IV", "FE"),
+        ("Sony", "Sony A7 III", "FE"),
+        ("Fujifilm", "Fujifilm X-T4", "XF"),
+        ("Fujifilm", "Fujifilm X-T5", "XF"),
+        ("Olympus", "Olympus OM-D E-M1 Mark III", "M.Zuiko"),
+        ("Leica", "Leica Q2", "Summilux"),
     ]
-    make, model = random.choice(camera_pool)
+    make, model, mount = random.choice(camera_pool)
 
     # 生成合理的拍摄参数组合
     focal = random.randint(24, 135)
     fnumber = random.choice([1.4, 1.8, 2.0, 2.8, 4.0, 5.6, 8.0, 11.0])
     iso = random.choice([100, 200, 400, 800, 1600])
     shutter_denom = random.choice([60, 125, 250, 500, 1000, 2000])
+
+    # 镜头名匹配卡口
+    if mount == "Summilux":
+        lens = f"Leica {mount} {focal}mm f/{fnumber} ASPH."
+    elif mount == "M.Zuiko":
+        lens = f"Olympus {mount} Digital ED {focal}mm f/{fnumber} PRO"
+    else:
+        lens = f"{mount} {focal}mm f/{fnumber}"
 
     exif_dict = {
         "0th": {
@@ -490,7 +589,7 @@ def add_fake_exif(img):
             piexif.ExifIFD.ISOSpeedRatings: iso,
             piexif.ExifIFD.FocalLength: (focal, 1),
             piexif.ExifIFD.FocalLengthIn35mmFilm: (focal, 1),
-            piexif.ExifIFD.LensModel: f"EF{focal}mm f/{fnumber}",
+            piexif.ExifIFD.LensModel: lens,
         },
     }
     exif_bytes = piexif.dump(exif_dict)
@@ -515,7 +614,14 @@ def process(input_path, output_path, params=None):
 
     rng = get_rng(params.get("seed"))
 
-    # 1. FFT 频谱匹配
+    # 1. DFL 频谱对抗
+    if params.get("dfl_enabled", False):
+        info("DFL 频谱对抗...")
+        arr = dfl_attack(arr, iterations=params.get("dfl_iterations", 80),
+                         strength=params.get("dfl_strength", 0.6),
+                         seed=rng.integers(0, 2**31))
+
+    # 2. FFT 频谱匹配
     if params.get("fft_enabled", True):
         info("FFT 频谱匹配...")
         arr = fft_spectrum_match(
