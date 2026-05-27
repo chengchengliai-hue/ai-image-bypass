@@ -44,6 +44,12 @@ PARAMS = {
     "perturb_enabled": True,
     "perturb_magnitude": 0.015,  # 翻 3 倍
 
+    # ---- 纹理归一化 (拉 residual std) ----
+    "glcm_enabled": True,
+    "glcm_strength": 0.45,       # GLCM 纹理对比度增强强度
+    "lbp_enabled": True,
+    "lbp_strength": 0.35,        # LBP 纹理多样性增强强度
+
     # ---- 白平衡 ----
     "awb_enabled": False,        # 关掉，灰世界假设会杀死暖色调
 
@@ -61,6 +67,118 @@ def info(msg):
 def get_rng(seed=None):
     return np.random.default_rng(seed)
 
+
+# ============================================================
+# GLCM 纹理归一化 —— 改纹理统计分布，拉高 residual
+# ============================================================
+
+def glcm_normalize(img_rgb, strength=0.4, seed=None):
+    """
+    在 LAB 亮度通道上做 GLCM 纹理对比度增强。
+    AI 图纹理往往过于均匀/homogeneous，通过降低 homogeneity 和提升 contrast
+    来模拟真实相机传感器的纹理多样性。
+    """
+    from skimage.feature import graycomatrix, graycoprops
+    import cv2
+    rng = get_rng(seed)
+
+    h, w = img_rgb.shape[:2]
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    L, A, B_ch = cv2.split(lab)
+    L_f = L.astype(np.float32)
+
+    # 量化到 64 级以加速 GLCM 计算
+    levels = 64
+    L_q = np.floor(L_f / 255.0 * (levels - 1)).astype(np.uint8)
+
+    # 计算 GLCM
+    glcm = graycomatrix(L_q, distances=[1], angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
+                        levels=levels, symmetric=True, normed=True)
+    contrast = graycoprops(glcm, 'contrast').mean()
+    homogeneity = graycoprops(glcm, 'homogeneity').mean()
+
+    # AI 图的 homogeneity 偏高，contrast 偏低
+    # 目标：降 homogeneity，升 contrast
+    target_contrast = contrast * (1.0 + 0.3 * strength)   # 提升对比度
+    target_homogeneity = homogeneity * (1.0 - 0.15 * strength)  # 降低均匀度
+    eps = 1e-8
+
+    contrast_scale = np.sqrt(target_contrast / (contrast + eps))
+    adjusted_L = L_f * contrast_scale
+    # 双边滤波保边，sigma 跟 homogeneity 关联
+    sigma = float(np.clip(75.0 / (homogeneity / (target_homogeneity + eps) + eps), 25.0, 150.0))
+    adjusted_L = cv2.bilateralFilter(adjusted_L.astype(np.float32), d=9,
+                                     sigmaColor=sigma, sigmaSpace=sigma)
+
+    # 微噪声模拟真实纹理
+    noise = rng.normal(0, 0.02 * strength, (h, w)).astype(np.float32) * 255.0
+    noise = cv2.GaussianBlur(noise, (3, 3), sigmaX=0.5)
+
+    blended_L = (1.0 - strength) * L_f + strength * adjusted_L + noise
+    out_L = np.clip(blended_L, 0, 255).astype(np.uint8)
+
+    return cv2.cvtColor(cv2.merge((out_L, A, B_ch)), cv2.COLOR_LAB2RGB)
+
+
+# ============================================================
+# LBP 纹理归一化 —— 增加纹理模式多样性
+# ============================================================
+
+def lbp_normalize(img_rgb, radius=3, n_points=24, strength=0.4, seed=None):
+    """
+    LBP 直方图展宽，增加局部纹理模式多样性。
+    AI 图 LBP 分布集中在少数模式（纹理过于规整），通过 CDF 拉伸
+    增加纹理模式的丰富度。
+    """
+    from skimage.feature import local_binary_pattern
+    import cv2
+    rng = get_rng(seed)
+
+    h, w = img_rgb.shape[:2]
+    gray = np.mean(img_rgb.astype(np.float32), axis=2).astype(np.uint8)
+    eps = 1e-8
+
+    # 计算 LBP
+    lbp = local_binary_pattern(gray, n_points, radius, method='uniform')
+    lbp_int = np.rint(lbp).astype(np.int32)
+    n_bins = n_points + 2  # 'uniform' 模式的 bin 数
+
+    # 统计直方图
+    counts = np.bincount(lbp_int.ravel(), minlength=n_bins).astype(np.float64)
+    hist = counts / (counts.sum() + eps)
+
+    # CDF 拉伸：让分布更均匀（模拟真图的纹理多样性）
+    cdf = np.cumsum(hist)
+    # 目标 CDF：从当前分布向均匀分布移动 strength
+    uniform_cdf = np.linspace(0, 1, n_bins)
+    target_cdf = (1.0 - strength) * cdf + strength * uniform_cdf
+
+    # 构建映射表：源 bin → 目标 bin
+    mapping = np.searchsorted(target_cdf, cdf).astype(np.float32)
+    mapping = np.clip(mapping, 0, n_bins - 1)
+
+    # 逐像素缩放
+    scale_map = mapping[lbp_int]
+    denom = lbp_int.astype(np.float32) + eps
+    scale = scale_map / denom
+    scale = np.clip(scale, 0.7, 1.3)  # 限制单像素变化幅度
+
+    # 只对亮度做
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    L = lab[:, :, 0].astype(np.float32)
+    A = lab[:, :, 1]
+    B_ch = lab[:, :, 2]
+
+    L_adjusted = L * scale
+    L_blend = (1.0 - strength) * L + strength * L_adjusted
+
+    # 微噪声
+    noise = rng.normal(0, 0.015 * strength, (h, w)).astype(np.float32) * 255.0
+    noise = cv2.GaussianBlur(noise, (3, 3), sigmaX=0.5)
+    L_blend += noise
+
+    L_out = np.clip(L_blend, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.merge((L_out, A, B_ch)), cv2.COLOR_LAB2RGB)
 
 # ============================================================
 # FFT 频谱匹配 (基于原项目 V3 简化)
@@ -339,21 +457,40 @@ def add_fake_exif(img):
     except ImportError:
         return img  # 没装 piexif 就跳过
 
-    brands = ["Canon", "Nikon", "Sony", "Fujifilm", "Olympus", "Leica"]
-    models = ["EOS 5D Mark III", "D850", "Alpha 7R IV", "X-T4",
-              "OM-D E-M1 Mark III", "Q2"]
+    # 品牌型号严格配对，避免 Sony + X-T4 这种自相矛盾
+    camera_pool = [
+        ("Canon", "Canon EOS 5D Mark III"),
+        ("Canon", "Canon EOS R6"),
+        ("Nikon", "Nikon D850"),
+        ("Nikon", "Nikon Z6 II"),
+        ("Sony", "Sony Alpha 7R IV"),
+        ("Sony", "Sony A7 III"),
+        ("Fujifilm", "Fujifilm X-T4"),
+        ("Fujifilm", "Fujifilm X-T5"),
+        ("Olympus", "Olympus OM-D E-M1 Mark III"),
+        ("Leica", "Leica Q2"),
+    ]
+    make, model = random.choice(camera_pool)
+
+    # 生成合理的拍摄参数组合
+    focal = random.randint(24, 135)
+    fnumber = random.choice([1.4, 1.8, 2.0, 2.8, 4.0, 5.6, 8.0, 11.0])
+    iso = random.choice([100, 200, 400, 800, 1600])
+    shutter_denom = random.choice([60, 125, 250, 500, 1000, 2000])
 
     exif_dict = {
         "0th": {
-            piexif.ImageIFD.Make: random.choice(brands),
-            piexif.ImageIFD.Model: random.choice(models),
-            piexif.ImageIFD.Software: "Adobe Lightroom",
+            piexif.ImageIFD.Make: make,
+            piexif.ImageIFD.Model: model,
+            piexif.ImageIFD.Software: "Adobe Lightroom Classic",
         },
         "Exif": {
-            piexif.ExifIFD.FNumber: (random.randint(14, 40), 10),
-            piexif.ExifIFD.ExposureTime: (1, random.randint(60, 2000)),
-            piexif.ExifIFD.ISOSpeedRatings: random.choice([100, 200, 400, 800]),
-            piexif.ExifIFD.FocalLength: (random.randint(24, 135), 1),
+            piexif.ExifIFD.FNumber: (int(fnumber * 10), 10),
+            piexif.ExifIFD.ExposureTime: (1, shutter_denom),
+            piexif.ExifIFD.ISOSpeedRatings: iso,
+            piexif.ExifIFD.FocalLength: (focal, 1),
+            piexif.ExifIFD.FocalLengthIn35mmFilm: (focal, 1),
+            piexif.ExifIFD.LensModel: f"EF{focal}mm f/{fnumber}",
         },
     }
     exif_bytes = piexif.dump(exif_dict)
@@ -411,18 +548,30 @@ def process(input_path, output_path, params=None):
             seed=rng.integers(0, 2**31),
         )
 
-    # 3. 白平衡
+    # 3. GLCM 纹理归一化
+    if params.get("glcm_enabled", False):
+        info("GLCM 纹理归一化...")
+        arr = glcm_normalize(arr, strength=params.get("glcm_strength", 0.45),
+                             seed=rng.integers(0, 2**31))
+
+    # 4. LBP 纹理归一化
+    if params.get("lbp_enabled", False):
+        info("LBP 纹理归一化...")
+        arr = lbp_normalize(arr, strength=params.get("lbp_strength", 0.35),
+                            seed=rng.integers(0, 2**31))
+
+    # 5. 白平衡
     if params.get("awb_enabled", True):
         info("自动白平衡...")
         arr = auto_white_balance(arr)
 
-    # 4. 高斯噪声
+    # 6. 高斯噪声
     if params.get("noise_enabled", True):
         info("高斯噪声注入...")
         arr = add_gaussian_noise(arr, std_frac=params.get("noise_std_frac", 0.01),
                                  seed=rng.integers(0, 2**31))
 
-    # 5. 像素扰动
+    # 7. 像素扰动
     if params.get("perturb_enabled", True):
         info("像素扰动...")
         arr = random_perturbation(arr, magnitude=params.get("perturb_magnitude", 0.005),
