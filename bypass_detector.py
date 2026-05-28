@@ -19,7 +19,7 @@ PARAMS = {
     "fft_enabled": True,
     "fft_mode": "model",         # "model"=1/f幂律, "ref"=参考图, "auto"=自动
     "fft_cutoff": 0.15,          # 低频保护半径缩小，让更多频率参与修改
-    "fft_strength": 0.65,        # 取 v8(0.85过高) 和 v9(0.55过糊) 中间
+    "fft_strength": 0.65,        # 恢复v10参数
     "fft_alpha": 1.0,            # alpha 太高=压高频=模糊，回到1.0
     "fft_randomness": 0.04,
     "fft_radial_smooth": 5,      # 回到5，保持细节
@@ -53,7 +53,7 @@ PARAMS = {
     "glcm_enabled": True,
     "glcm_strength": 0.45,       # GLCM 纹理对比度增强强度
     "lbp_enabled": True,
-    "lbp_strength": 0.35,        # LBP 纹理多样性增强强度
+    "lbp_strength": 0.20,        # 加回来，降到0.2
 
     # ---- 白平衡 ----
     "awb_enabled": False,        # 关掉，灰世界假设会杀死暖色调
@@ -71,6 +71,48 @@ def info(msg):
 
 def get_rng(seed=None):
     return np.random.default_rng(seed)
+
+
+# ============================================================
+# 图像质量指标（用于 ablation 诊断）
+# ============================================================
+
+def compute_metrics(arr_rgb, original=None, label=""):
+    """计算并打印关键图像质量指标"""
+    import cv2
+    gray = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    # 1. high/low freq ratio
+    F = np.fft.fftshift(np.fft.fft2(gray))
+    mag = np.abs(F)
+    h, w = mag.shape
+    cy, cx = h // 2, w // 2
+    y, x = np.ogrid[:h, :w]
+    r = np.sqrt((y - cy)**2 + (x - cx)**2)
+    cutoff_r = min(h, w) * 0.15
+    low_energy = mag[r < cutoff_r].sum()
+    high_energy = mag[r >= cutoff_r].sum()
+    hl_ratio = high_energy / (low_energy + 1e-8)
+
+    # 2. Laplacian variance (sharpness/texture)
+    lap = cv2.Laplacian(gray.astype(np.uint8), cv2.CV_32F)
+    lap_var = lap.var()
+
+    # 3. Edge density (Canny)
+    edges = cv2.Canny(gray.astype(np.uint8), 50, 150)
+    edge_density = edges.sum() / (h * w * 255.0)
+
+    parts = [f"high/low={hl_ratio:.5f}", f"lap_var={lap_var:.1f}", f"edge={edge_density:.4f}"]
+
+    # 4. Residual vs original
+    if original is not None:
+        orig_gray = cv2.cvtColor(original, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        diff = np.abs(gray - orig_gray)
+        parts.append(f"res_std={diff.std():.2f}")
+        parts.append(f"res_mean={diff.mean():.2f}")
+
+    print(f"  [{label}] {' | '.join(parts)}")
+    return {"hl_ratio": hl_ratio, "lap_var": lap_var, "edge_density": edge_density}
 
 
 # ============================================================
@@ -610,9 +652,13 @@ def process(input_path, output_path, params=None):
     print(f"读取: {input_path}")
     img = Image.open(input_path).convert('RGB')
     arr = np.array(img)
+    original = arr.copy()
     print(f"  尺寸: {arr.shape[1]}x{arr.shape[0]}")
 
     rng = get_rng(params.get("seed"))
+
+    # 基线
+    compute_metrics(arr, label="original")
 
     # 1. DFL 频谱对抗
     if params.get("dfl_enabled", False):
@@ -620,6 +666,7 @@ def process(input_path, output_path, params=None):
         arr = dfl_attack(arr, iterations=params.get("dfl_iterations", 80),
                          strength=params.get("dfl_strength", 0.6),
                          seed=rng.integers(0, 2**31))
+        compute_metrics(arr, original, "after_dfl")
 
     # 2. FFT 频谱匹配
     if params.get("fft_enabled", True):
@@ -634,8 +681,9 @@ def process(input_path, output_path, params=None):
             radial_smooth=params.get("fft_radial_smooth", 7),
             seed=rng.integers(0, 2**31),
         )
+        compute_metrics(arr, original, "after_fft")
 
-    # 2. 相机管线模拟
+    # 3. 相机管线模拟
     if params.get("camera_enabled", True):
         info("相机管线模拟...")
         arr = simulate_camera(
@@ -653,35 +701,41 @@ def process(input_path, output_path, params=None):
             jpeg_qmax=params.get("jpeg_qmax", 96),
             seed=rng.integers(0, 2**31),
         )
+        compute_metrics(arr, original, "after_camera")
 
-    # 3. GLCM 纹理归一化
+    # 4. GLCM 纹理归一化
     if params.get("glcm_enabled", False):
         info("GLCM 纹理归一化...")
         arr = glcm_normalize(arr, strength=params.get("glcm_strength", 0.45),
                              seed=rng.integers(0, 2**31))
+        compute_metrics(arr, original, "after_glcm")
 
-    # 4. LBP 纹理归一化
+    # 5. LBP 纹理归一化
     if params.get("lbp_enabled", False):
         info("LBP 纹理归一化...")
         arr = lbp_normalize(arr, strength=params.get("lbp_strength", 0.35),
                             seed=rng.integers(0, 2**31))
+        compute_metrics(arr, original, "after_lbp")
 
-    # 5. 白平衡
+    # 6. 白平衡
     if params.get("awb_enabled", True):
         info("自动白平衡...")
         arr = auto_white_balance(arr)
+        compute_metrics(arr, original, "after_awb")
 
-    # 6. 高斯噪声
+    # 7. 高斯噪声
     if params.get("noise_enabled", True):
         info("高斯噪声注入...")
         arr = add_gaussian_noise(arr, std_frac=params.get("noise_std_frac", 0.01),
                                  seed=rng.integers(0, 2**31))
+        compute_metrics(arr, original, "after_noise")
 
-    # 7. 像素扰动
+    # 8. 像素扰动
     if params.get("perturb_enabled", True):
         info("像素扰动...")
         arr = random_perturbation(arr, magnitude=params.get("perturb_magnitude", 0.005),
                                   seed=rng.integers(0, 2**31))
+        compute_metrics(arr, original, "after_perturb")
 
     # 保存
     out_img = Image.fromarray(arr)
